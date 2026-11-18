@@ -224,6 +224,8 @@ export interface Repo {
   updatedAt: string;
   objects: Map<string, GitObject>;
   refs: Map<string, string>;
+  /** Bumped on every ref mutation; git response caches key off it. */
+  refsVersion: number;
   issues: Issue[];
   pulls: Pull[];
   labels: Map<string, Label>;
@@ -247,6 +249,25 @@ export function buildCommitBytes(opts: {
   lines.push(`committer ${opts.author} ${stamp}`);
   const message = opts.message.endsWith('\n') ? opts.message : `${opts.message}\n`;
   return Buffer.from(`${lines.join('\n')}\n\n${message}`, 'utf8');
+}
+
+/** Read one request header from Node's raw headers object (no Map build per request). */
+export function getHeader(headers: NodeJS.Dict<string | string[]>, name: string): string {
+  const value = headers[name];
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value) && value.length > 0) return value[0]!;
+  return '';
+}
+
+/** Set a ref, bumping the repo's refs version (git response caches key off it). */
+export function setRef(repo: Repo, ref: string, oid: string): void {
+  repo.refs.set(ref, oid);
+  repo.refsVersion += 1;
+}
+
+/** Delete a ref, bumping the repo's refs version when one was removed. */
+export function deleteRef(repo: Repo, ref: string): void {
+  if (repo.refs.delete(ref)) repo.refsVersion += 1;
 }
 
 /** Global (Relay) ids: opaque base64, stable across reads, decodable by this server. */
@@ -334,6 +355,7 @@ export class Store {
       updatedAt: this.iso(now),
       objects: new Map(),
       refs: new Map(),
+      refsVersion: 0,
       issues: [],
       pulls: [],
       labels: new Map(),
@@ -498,7 +520,7 @@ export class Store {
     });
     const commitOid = hashObject('commit', commitData);
     repo.objects.set(commitOid, { type: 'commit', data: commitData });
-    repo.refs.set(`refs/heads/${branch}`, commitOid);
+    setRef(repo, `refs/heads/${branch}`, commitOid);
     return { commitOid, blobOid, isUpdate };
   }
 
@@ -520,7 +542,7 @@ export class Store {
     });
     const commitOid = hashObject('commit', commitData);
     repo.objects.set(commitOid, { type: 'commit', data: commitData });
-    repo.refs.set(`refs/heads/${opts.branch}`, commitOid);
+    setRef(repo, `refs/heads/${opts.branch}`, commitOid);
     return commitOid;
   }
 
@@ -739,7 +761,7 @@ export class Store {
     });
     const commitOid = hashObject('commit', commitData);
     repo.objects.set(commitOid, { type: 'commit', data: commitData });
-    repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
+    setRef(repo, `refs/heads/${pull.baseRef}`, commitOid);
     pull.state = 'closed';
     pull.merged = true;
     pull.mergedAt = this.iso(now);

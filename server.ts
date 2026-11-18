@@ -38,20 +38,21 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function headersOf(req: IncomingMessage): Map<string, string> {
-  const out = new Map<string, string>();
-  for (const [name, value] of Object.entries(req.headers)) {
-    if (typeof value === 'string') out.set(name.toLowerCase(), value);
-    else if (Array.isArray(value) && value.length > 0) out.set(name.toLowerCase(), value[0]!);
-  }
-  return out;
-}
-
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
   const text = body === null ? '' : JSON.stringify(body);
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': Buffer.byteLength(text),
+    ...extraHeaders,
+  });
+  res.end(text);
+}
+
+/** Send a pre-serialized JSON body (its byte length already known; no re-stringify). */
+function sendText(res: ServerResponse, status: number, text: string, byteLength: number, extraHeaders: Record<string, string> = {}): void {
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': byteLength,
     ...extraHeaders,
   });
   res.end(text);
@@ -72,13 +73,16 @@ export function createForgeServer(store: Store): Server {
         const rawSegments = url.pathname.split('/').filter((s) => s !== '');
         let segments: string[];
         try {
-          segments = rawSegments.map((s) => decodeURIComponent(s));
+          // Most path segments carry no '%' at all; skip the decode call for those.
+          segments = rawSegments.map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
         } catch {
           sendJson(res, 400, { message: 'Bad Request' }, { 'x-github-request-id': rid });
           return;
         }
         const method = req.method ?? 'GET';
-        const headers = headersOf(req);
+        // Handlers read the headers they need straight off req.headers (already
+        // lower-cased by Node); building a Map per request was pure overhead.
+        const headers = req.headers;
         const origin = `http://${req.headers.host ?? '127.0.0.1'}`;
         // DELETE carries a body too (DELETE /contents sends {message, sha}).
         const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
@@ -98,6 +102,10 @@ export function createForgeServer(store: Store): Server {
             if (response.status === 204) {
               res.writeHead(204, { 'content-length': 0, ...extra });
               res.end();
+              return;
+            }
+            if (response.text !== undefined) {
+              sendText(res, response.status, response.text, response.textLength ?? Buffer.byteLength(response.text), extra);
               return;
             }
             sendJson(res, response.status, response.body, extra);

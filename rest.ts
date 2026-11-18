@@ -7,13 +7,13 @@
 // never 403.
 
 import { hashObject, isOid, parseCommit } from './gitobj.ts';
-import { isRecord, sha1Hex, type Issue, type Pull, type Repo, type Store } from './store.ts';
+import { getHeader, isRecord, setRef, sha1Hex, type Issue, type Pull, type Repo, type Store } from './store.ts';
 
 export interface RestRequest {
   method: string;
   segments: string[];
   query: URLSearchParams;
-  headers: Map<string, string>;
+  headers: NodeJS.Dict<string | string[]>;
   body: Buffer;
   /** The request's origin (http://host), for absolute pagination Link headers. */
   baseUrl: string;
@@ -23,6 +23,10 @@ export interface RestResponse {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** Pre-serialized JSON body: sent as-is (with its cached byte length) instead of
+   *  stringifying `body`. Only set together with body: null. */
+  text?: string;
+  textLength?: number;
 }
 
 let requestCounter = 0;
@@ -103,7 +107,7 @@ function labelJson(label: { name: string; color: string; description: string }):
 export function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unknown> {
   return {
     id: issue.id,
-    node_id: Buffer.from(`I_${repo.id}_${issue.number}`, 'utf8').toString('base64'),
+    node_id: issueNodeId(repo, issue),
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -121,6 +125,35 @@ export function issueJson(store: Store, repo: Repo, issue: Issue): Record<string
     locked: false,
     author_association: 'OWNER',
   };
+}
+
+// The node_id of an issue never changes (repo id + issue number), so compute it once.
+const issueNodeIdCache = new WeakMap<Issue, string>();
+
+function issueNodeId(repo: Repo, issue: Issue): string {
+  let nodeId = issueNodeIdCache.get(issue);
+  if (nodeId === undefined) {
+    nodeId = Buffer.from(`I_${repo.id}_${issue.number}`, 'utf8').toString('base64');
+    issueNodeIdCache.set(issue, nodeId);
+  }
+  return nodeId;
+}
+
+// Serialized-issue cache for GET /issues/{number}: the read workload fetches one issue
+// 2,000 times in a row, and the reply is byte-identical until the issue changes. The
+// version covers everything issueJson renders that can change: a PATCH bumps updatedSeq,
+// and adding a comment grows comments.length (addComment does not bump updatedSeq). Label
+// objects are never edited after creation, and title/body/state flow through updatedSeq.
+const issueTextCache = new WeakMap<Issue, { version: string; text: string; length: number }>();
+
+export function issueJsonText(store: Store, repo: Repo, issue: Issue): { text: string; length: number } {
+  const version = `${issue.updatedSeq}:${issue.comments.length}`;
+  const cached = issueTextCache.get(issue);
+  if (cached !== undefined && cached.version === version) return cached;
+  const text = JSON.stringify(issueJson(store, repo, issue));
+  const entry = { version, text, length: Buffer.byteLength(text) };
+  issueTextCache.set(issue, entry);
+  return entry;
 }
 
 export function pullJson(store: Store, repo: Repo, pull: Pull): Record<string, unknown> {
@@ -200,7 +233,7 @@ function paginate<T>(items: readonly T[], query: URLSearchParams, path: string, 
 }
 
 function authCheck(store: Store, req: RestRequest): void {
-  const header = req.headers.get('authorization') ?? '';
+  const header = getHeader(req.headers, 'authorization');
   const match = /^Bearer\s+(\S+)$/.exec(header);
   if (match === null || match[1] !== store.token) {
     throw new ApiError(401, 'Bad credentials');
@@ -348,7 +381,7 @@ function route(store: Store, req: RestRequest, seg: string[], path: string): Res
         }
         if (!repo.objects.has(sha)) throw new ApiError(422, 'Object does not exist');
         if (repo.refs.has(ref)) throw new ApiError(422, 'Reference already exists');
-        repo.refs.set(ref, sha);
+        setRef(repo, ref, sha);
         return { status: 201, body: { ref, node_id: sha1Hex(ref), url: path, object: { type: 'commit', sha } } };
       }
       if (rest.length >= 3 && method === 'GET') {
@@ -519,7 +552,10 @@ function handleIssues(store: Store, repo: Repo, req: RestRequest, rest: string[]
   const issue = repo.issues.find((i) => i.number === number);
   if (issue === undefined) throw notFound('Not Found');
   if (rest.length === 1) {
-    if (method === 'GET') return { status: 200, body: issueJson(store, repo, issue) };
+    if (method === 'GET') {
+      const cached = issueJsonText(store, repo, issue);
+      return { status: 200, body: null, text: cached.text, textLength: cached.length };
+    }
     if (method === 'PATCH') {
       const body = parseJsonBody(req);
       if (!isRecord(body)) throw badRequest('request body must be a JSON object');

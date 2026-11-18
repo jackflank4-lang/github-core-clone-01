@@ -9,7 +9,7 @@
 // documents (two results, in order). Unknown field = HTTP 200 + an errors array
 // naming it. Unknown repo = data.repository null, no errors. No token = exactly 401.
 
-import { decodeGlobalId, globalId, isRecord, type Issue, type Pull, type Repo, type Store } from './store.ts';
+import { decodeGlobalId, getHeader, globalId, isRecord, type Issue, type Pull, type Repo, type Store } from './store.ts';
 
 // ---------------------------------------------------------------------------
 // parser: the query-language subset these documents use
@@ -1015,7 +1015,7 @@ export function executeGraphQL(store: Store, query: string, variables: Record<st
 
 export interface GraphQLRequest {
   method: string;
-  headers: Map<string, string>;
+  headers: NodeJS.Dict<string | string[]>;
   body: Buffer;
 }
 
@@ -1028,7 +1028,7 @@ export interface GraphQLResponse {
 export function handleGraphQL(store: Store, segments: string[], req: GraphQLRequest): GraphQLResponse | null {
   if (segments.length !== 2 || segments[0] !== 'api' || segments[1] !== 'graphql') return null;
   if (req.method !== 'POST') return { status: 404, body: { message: 'Not Found' } };
-  const header = req.headers.get('authorization') ?? '';
+  const header = getHeader(req.headers, 'authorization');
   const match = /^Bearer\s+(\S+)$/.exec(header);
   if (match === null || match[1] !== store.token) {
     return { status: 401, body: { message: 'Bad credentials' } };

@@ -13,7 +13,7 @@
 // objects, ids unchanged.
 
 import { issueJson, pullJson, repoJson } from './rest.ts';
-import { isRecord, type Repo, type Store } from './store.ts';
+import { getHeader, isRecord, type Repo, type Store } from './store.ts';
 
 const SERVER_NAME = 'forge';
 const SERVER_VERSION = '1.0.0';
@@ -145,7 +145,7 @@ const TOOLS = Object.freeze([
 
 export interface McpRequest {
   method: string;
-  headers: Map<string, string>;
+  headers: NodeJS.Dict<string | string[]>;
   body: Buffer;
 }
 
@@ -194,7 +194,7 @@ export function handleMcp(store: Store, segments: string[], req: McpRequest): Mc
   if (segments.length !== 1 || segments[0] !== 'mcp') return null;
   if (req.method === 'DELETE') return { status: 204, body: null, contentType: 'application/json' };
   if (req.method !== 'POST') return { status: 404, body: { message: 'Not Found' }, contentType: 'application/json' };
-  const header = req.headers.get('authorization') ?? '';
+  const header = getHeader(req.headers, 'authorization');
   const match = /^Bearer\s+(\S+)$/.exec(header);
   if (match === null || match[1] !== store.token) {
     return { status: 401, body: { message: 'Bad credentials' }, contentType: 'application/json' };

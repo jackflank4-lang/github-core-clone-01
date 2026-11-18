@@ -24,12 +24,13 @@ import {
   type GitObject,
 } from './gitobj.ts';
 import type { Repo, Store } from './store.ts';
+import { deleteRef, getHeader, setRef } from './store.ts';
 
 export interface GitRequest {
   method: string;
   segments: string[];
   query: URLSearchParams;
-  headers: Map<string, string>;
+  headers: NodeJS.Dict<string | string[]>;
   body: Buffer;
 }
 
@@ -43,6 +44,17 @@ const AGENT = 'forge/1.0.0';
 const UPLOAD_V2_CAPS = ['agent=forge/1.0.0', 'ls-refs=unborn', 'fetch=shallow thin-pack', 'object-format=sha1'];
 const UPLOAD_V0_CAPS = 'multi_ack thin-pack side-band-64k ofs-delta agent=forge/1.0.0';
 const RECEIVE_V0_CAPS = 'report-status side-band-64k delete-refs agent=forge/1.0.0';
+
+// Response caches. Entries are immutable by construction:
+// - a fetch pack for (repo, tip) is fixed because objects are content-addressed and
+//   never overwritten, and the tip oid is part of the key;
+// - advertisements depend on the ref set, so they key off repo.refsVersion (bumped on
+//   every ref mutation) plus the default branch (a PATCH can retarget it).
+// The store is per-trial (one process per trial), so nothing here can go stale across
+// trials, and a trial holds only a handful of repos.
+const lsRefsCache = new Map<string, Buffer>();
+const fetchCache = new Map<string, Buffer>();
+const infoRefsCache = new Map<string, Buffer>();
 
 function jsonResponse(status: number, message: string): GitResponse {
   return { status, body: Buffer.from(JSON.stringify({ message }), 'utf8'), contentType: 'application/json' };
@@ -82,7 +94,7 @@ export function handleGit(store: Store, req: GitRequest): GitResponse | null {
     if (req.method === 'GET' && tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
       if (repo === null) return jsonResponse(404, 'Not Found');
       const service = req.query.get('service') ?? '';
-      if (service === 'git-upload-pack') return infoRefsUpload(repo, (req.headers.get('git-protocol') ?? '') === 'version=2');
+      if (service === 'git-upload-pack') return infoRefsUpload(repo, getHeader(req.headers, 'git-protocol') === 'version=2');
       if (service === 'git-receive-pack') return infoRefsReceive(repo);
       return jsonResponse(400, 'service is required');
     }
@@ -110,11 +122,22 @@ export function handleGit(store: Store, req: GitRequest): GitResponse | null {
 
 /** GET /info/refs?service=git-upload-pack. v2 when the client asked for it, else v0. */
 function infoRefsUpload(repo: Repo, wantsV2: boolean): GitResponse {
+  const cacheKey = `${repo.id}:${repo.refsVersion}:${repo.defaultBranch}:${wantsV2 ? 'v2' : 'v0'}`;
+  const cached = infoRefsCache.get(cacheKey);
+  if (cached !== undefined) {
+    return { status: 200, body: cached, contentType: 'application/x-git-upload-pack-advertisement' };
+  }
+  const body = buildInfoRefsUpload(repo, wantsV2);
+  infoRefsCache.set(cacheKey, body);
+  return { status: 200, body, contentType: 'application/x-git-upload-pack-advertisement' };
+}
+
+function buildInfoRefsUpload(repo: Repo, wantsV2: boolean): Buffer {
   if (wantsV2) {
     const parts: Buffer[] = [pktLine('version 2\n')];
     for (const cap of UPLOAD_V2_CAPS) parts.push(pktLine(`${cap}\n`));
     parts.push(PKT_FLUSH);
-    return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-advertisement' };
+    return Buffer.concat(parts);
   }
   // v0: "# service=git-upload-pack" + flush, then the refs with caps on the first line.
   const parts: Buffer[] = [pktLine('# service=git-upload-pack\n'), PKT_FLUSH];
@@ -132,11 +155,16 @@ function infoRefsUpload(repo: Repo, wantsV2: boolean): GitResponse {
     }
   }
   parts.push(PKT_FLUSH);
-  return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-advertisement' };
+  return Buffer.concat(parts);
 }
 
 /** GET /info/refs?service=git-receive-pack — v0 only. */
 function infoRefsReceive(repo: Repo): GitResponse {
+  const cacheKey = `${repo.id}:${repo.refsVersion}:${repo.defaultBranch}:recv`;
+  const cached = infoRefsCache.get(cacheKey);
+  if (cached !== undefined) {
+    return { status: 200, body: cached, contentType: 'application/x-git-receive-pack-advertisement' };
+  }
   const parts: Buffer[] = [pktLine('# service=git-receive-pack\n'), PKT_FLUSH];
   const tip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
   const symref = `symref=HEAD:refs/heads/${repo.defaultBranch}`;
@@ -152,7 +180,9 @@ function infoRefsReceive(repo: Repo): GitResponse {
     }
   }
   parts.push(PKT_FLUSH);
-  return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-receive-pack-advertisement' };
+  const body = Buffer.concat(parts);
+  infoRefsCache.set(cacheKey, body);
+  return { status: 200, body, contentType: 'application/x-git-receive-pack-advertisement' };
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +190,7 @@ function infoRefsReceive(repo: Repo): GitResponse {
 // ---------------------------------------------------------------------------
 
 function handleUploadPack(store: Store, repo: Repo, req: GitRequest): GitResponse {
-  const wantsV2 = (req.headers.get('git-protocol') ?? '') === 'version=2';
+  const wantsV2 = getHeader(req.headers, 'git-protocol') === 'version=2';
   const packets = decodePktLines(req.body);
   const firstData = packets.find((p) => p.kind === 'data');
   const firstLine = firstData === undefined ? '' : firstData.payload.toString('utf8').trim();
@@ -194,6 +224,11 @@ function handleLsRefs(repo: Repo, packets: ReturnType<typeof decodePktLines>): G
     else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice('ref-prefix '.length));
   }
   const keep = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+  const cacheKey = `${repo.id}:${repo.refsVersion}:${repo.defaultBranch}:${peel ? 'p' : ''}${symrefs ? 's' : ''}${unborn ? 'u' : ''}:${prefixes.join(',')}`;
+  const cached = lsRefsCache.get(cacheKey);
+  if (cached !== undefined) {
+    return { status: 200, body: cached, contentType: 'application/x-git-upload-pack-result' };
+  }
   const parts: Buffer[] = [];
   const tip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
   // HEAD: the default branch's tip (or unborn when the repo is empty). An empty repo
@@ -219,7 +254,9 @@ function handleLsRefs(repo: Repo, packets: ReturnType<typeof decodePktLines>): G
   }
   // An empty repo with no HEAD line (unborn not requested): git sends nothing but the flush.
   parts.push(PKT_FLUSH);
-  return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-result' };
+  const body = Buffer.concat(parts);
+  lsRefsCache.set(cacheKey, body);
+  return { status: 200, body, contentType: 'application/x-git-upload-pack-result' };
 }
 
 /** v2 fetch: [shallow-info] packfile, then flush. No acknowledgments section when the
@@ -234,6 +271,7 @@ function handleFetchV2(repo: Repo, packets: ReturnType<typeof decodePktLines>): 
   const clientShallow = new Set<string>();
   let depth: number | null = null;
   let hasDone = false;
+  let hasFilter = false;
   let afterDelim = false;
   for (const packet of packets) {
     if (packet.kind === 'delim') {
@@ -252,10 +290,26 @@ function handleFetchV2(repo: Repo, packets: ReturnType<typeof decodePktLines>): 
       if (Number.isInteger(n) && n > 0) depth = n;
     } else if (line.startsWith('deepen-since ')) {
       // Not supported by this forge: treat as a plain fetch (the suite never sends it).
+      hasFilter = true; // never cache a shape this handler answers approximately.
     } else if (line === 'done') {
       hasDone = true;
-    } else if (line === 'thin-pack' || line === 'no-progress' || line === 'ofs-delta' || line.startsWith('filter ')) {
+    } else if (line === 'thin-pack' || line === 'no-progress' || line === 'ofs-delta') {
       // Accepted and ignored (thin-pack is what we always send; no-progress is honoured).
+    } else if (line.startsWith('filter ')) {
+      // Accepted and ignored by this handler; never cache a filtered shape.
+      hasFilter = true;
+    }
+  }
+  // A single-want depth-1 fetch with no haves and no filter is fully determined by the
+  // wanted oid: the pack is the want's depth-1 closure, and objects are content-addressed
+  // and immutable, so the whole response can be reused verbatim. This is the clone
+  // workload's shape (50 concurrent depth-1 clones of one tip).
+  const cacheable = hasDone && depth === 1 && wants.length === 1 && haves.length === 0 && clientShallow.size === 0 && !hasFilter;
+  const cacheKey = cacheable ? `${repo.id}:${wants[0]}` : '';
+  if (cacheable) {
+    const cached = fetchCache.get(cacheKey);
+    if (cached !== undefined) {
+      return { status: 200, body: cached, contentType: 'application/x-git-upload-pack-result' };
     }
   }
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
@@ -286,7 +340,9 @@ function handleFetchV2(repo: Repo, packets: ReturnType<typeof decodePktLines>): 
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPackets(writePack(selection.objects)));
   parts.push(PKT_FLUSH);
-  return { status: 200, body: Buffer.concat(parts), contentType: 'application/x-git-upload-pack-result' };
+  const body = Buffer.concat(parts);
+  if (cacheable) fetchCache.set(cacheKey, body);
+  return { status: 200, body, contentType: 'application/x-git-upload-pack-result' };
 }
 
 /** v0 fetch: NAK/ACK lines, then the pack as sideband band-1, then flush. */
@@ -403,14 +459,14 @@ function applyPushCommand(repo: Repo, command: PushCommand, lookup: (oid: string
   if (isDelete) {
     if (current === undefined) return `ng ${command.ref} remote ref does not exist`;
     if (!isCreate && command.oldOid !== current) return `ng ${command.ref} non-fast-forward`;
-    repo.refs.delete(command.ref);
+    deleteRef(repo, command.ref);
     return `ok ${command.ref}`;
   }
   // The new object must exist (it arrived in the pack or was already stored).
   if (lookup(command.newOid) === undefined) return `ng ${command.ref} object not found`;
   if (isCreate) {
     if (current !== undefined) return `ng ${command.ref} reference already exists`;
-    repo.refs.set(command.ref, command.newOid);
+    setRef(repo, command.ref, command.newOid);
     return `ok ${command.ref}`;
   }
   // An update: the old value must match, and the new value must fast-forward the old.
@@ -421,6 +477,6 @@ function applyPushCommand(repo: Repo, command: PushCommand, lookup: (oid: string
   const newCommit = peelToCommit(command.newOid, lookup);
   if (oldCommit === null || newCommit === null) return `ng ${command.ref} non-fast-forward`;
   if (!isAncestor(oldCommit, newCommit, lookup)) return `ng ${command.ref} non-fast-forward`;
-  repo.refs.set(command.ref, command.newOid);
+  setRef(repo, command.ref, command.newOid);
   return `ok ${command.ref}`;
 }
