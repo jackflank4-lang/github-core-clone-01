@@ -1,707 +1,630 @@
-// rest.ts — the REST v3 API: repositories, branches, commits, contents, labels,
-// issues, comments and pull requests. Written fresh in this session from the
-// GitHub REST shape and the competition checks. Stdlib only: node:http.
+// rest.ts — GitHub REST API v3 (/api/v3). Written from scratch for the
+// github-core-clone-01 forge (Node 22, stdlib only). All reads/writes go
+// through the store; every reply is JSON with X-GitHub-Request-Id.
 
-import type { ServerResponse } from 'node:http';
-import {
-  commitHistory,
-  commitTree,
-  diffTrees,
-  flattenTree,
-  globalId,
-  lineDiff,
-  type Forge,
-  type Issue,
-  type PullRequest,
-  type Repo,
-} from './store.ts';
-import {
-  absoluteUrl,
-  Ctx,
-  nowIso,
-  paginate,
-  parseJsonBody,
-  rejectBadJson,
-  sendError,
-  sendJson,
-  sendNotFound,
-  userJson,
-} from './server.ts';
-import { blobSha } from './git.ts';
-import { hashObject, isObjectId, parseCommit, parseTag } from './gitobj.ts';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { ISO_TIME, Repo, Store, VIEWER_ID, VIEWER_LOGIN, type Issue, type PullRequest } from './store.ts';
+import { bool, num, parseJsonBody, sendEmpty, sendJson, sendJsonString, str } from './httputil.ts';
 
-const OAUTH_SCOPES = 'repo, read:org';
+const BASE = 'https://github.example';
 
-// ---------------------------------------------------------------------------
-// JSON shapes
-// ---------------------------------------------------------------------------
+function userJson(login: string, id: number): Record<string, unknown> {
+  return { login, id, type: 'User', avatar_url: '', html_url: `${BASE}/${login}` };
+}
 
-export function repoJson(ctx: Ctx, repo: Repo): Record<string, unknown> {
+export function repoJson(store: Store, repo: Repo): Record<string, unknown> {
   return {
     id: repo.id,
-    node_id: `R_${repo.id}`,
+    node_id: store.repoGlobalId(repo),
     name: repo.name,
     full_name: `${repo.owner}/${repo.name}`,
-    private: repo.private,
-    owner: { login: repo.owner, id: repo.owner === 'adaiversen' ? 1000 : 0, node_id: `U_${repo.owner === 'adaiversen' ? 1000 : 0}`, type: 'User' },
-    html_url: `https://github.com/${repo.owner}/${repo.name}`,
+    owner: userJson(repo.owner, repo.owner === VIEWER_LOGIN ? VIEWER_ID : 0),
+    private: repo.isPrivate,
     description: repo.description,
-    fork: false,
-    url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}`),
-    created_at: repo.createdAt,
-    updated_at: repo.updatedAt,
-    pushed_at: repo.updatedAt,
-    homepage: null,
-    size: repo.objects.size,
-    stargazers_count: 0,
-    watchers_count: 0,
-    language: null,
+    default_branch: repo.defaultBranch,
+    html_url: `${BASE}/${repo.owner}/${repo.name}`,
+    clone_url: `${BASE}/${repo.owner}/${repo.name}.git`,
+    git_url: `git://${BASE.slice(8)}/${repo.owner}/${repo.name}.git`,
+    ssh_url: `git@github.example:${repo.owner}/${repo.name}.git`,
+    created_at: ISO_TIME,
+    updated_at: ISO_TIME,
+    pushed_at: ISO_TIME,
     has_issues: true,
     has_projects: true,
-    has_downloads: true,
     has_wiki: true,
-    has_pages: false,
     forks_count: 0,
-    open_issues_count: repo.issues.filter((issue) => issue.state === 'open').length,
+    stargazers_count: 0,
+    watchers_count: 0,
+    open_issues_count: repo.issues.filter((i) => i.state === 'open').length,
     license: null,
-    allow_forking: true,
-    is_template: false,
     topics: [],
-    visibility: repo.private ? 'private' : 'public',
-    default_branch: repo.defaultBranch,
+    visibility: repo.isPrivate ? 'private' : 'public',
   };
 }
 
-export function issueJson(ctx: Ctx, repo: Repo, issue: Issue): string {
-  if (issue.restJson) return issue.restJson;
-  const text = JSON.stringify({
-    id: issue.id,
-    node_id: globalId('Issue', `${repo.owner}/${repo.name}#${issue.number}`),
-    url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`),
-    repository_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}`),
-    labels_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/labels{/name}`),
-    comments_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`),
-    events_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/events`),
-    html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}`,
+export function issueJson(store: Store, repo: Repo, issue: Issue): Record<string, unknown> {
+  return {
+    id: repo.id * 1000000 + issue.number,
+    node_id: store.issueGlobalId(repo, issue.number),
     number: issue.number,
-    state: issue.state,
     title: issue.title,
     body: issue.body,
-    user: { login: issue.user, id: 1000, node_id: 'U_1000', type: 'User' },
-    labels: issue.labels.map((label) => ({ id: 0, node_id: '', name: label.name, color: label.color, default: false, description: '' })),
+    state: issue.state,
+    labels: issue.labels.map((name) => ({ name, color: repo.labels.get(name)?.color ?? '000000' })),
+    user: userJson(VIEWER_LOGIN, VIEWER_ID),
     assignee: null,
     assignees: [],
     milestone: null,
-    locked: false,
-    active_lock_reason: null,
-    comments: 0,
-    created_at: issue.createdAt,
-    updated_at: issue.updatedAt,
-    closed_at: issue.state === 'closed' ? issue.updatedAt : null,
-    author_association: 'OWNER',
-    state_reason: null,
-  });
-  issue.restJson = text;
-  return text;
+    comments: issue.comments.length,
+    created_at: ISO_TIME,
+    updated_at: ISO_TIME,
+    closed_at: issue.state === 'closed' ? ISO_TIME : null,
+    html_url: `${BASE}/${repo.owner}/${repo.name}/issues/${issue.number}`,
+    url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
+  };
 }
 
-export function pullJson(ctx: Ctx, repo: Repo, pull: PullRequest): Record<string, unknown> {
-  const headUser = { login: repo.owner, id: 1000, node_id: 'U_1000', type: 'User' };
+/** Cached serialized single-issue JSON (the read benchmark hits this path). */
+function issueJsonString(store: Store, repo: Repo, issue: Issue): string {
+  const hit = repo.issueJsonCache.get(issue.number);
+  if (hit !== undefined) return hit;
+  const s = JSON.stringify(issueJson(store, repo, issue));
+  repo.issueJsonCache.set(issue.number, s);
+  return s;
+}
+
+export function pullJson(store: Store, repo: Repo, pr: PullRequest): Record<string, unknown> {
+  const mergeable = pr.state === 'open' ? !repo.prIsConflicted(pr) : null;
   return {
-    id: pull.id,
-    node_id: globalId('PullRequest', `${repo.owner}/${repo.name}#${pull.number}`),
-    url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull.number}`),
-    html_url: `https://github.com/${repo.owner}/${repo.name}/pulls/${pull.number}`,
-    diff_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull.number}.diff`,
-    patch_url: `https://github.com/${repo.owner}/${repo.name}/pull/${pull.number}.patch`,
-    issue_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/${pull.number}`),
-    number: pull.number,
-    state: pull.state,
-    locked: false,
-    title: pull.title,
-    user: { login: pull.user, id: 1000, node_id: 'U_1000', type: 'User' },
-    body: pull.body,
-    created_at: pull.createdAt,
-    updated_at: pull.updatedAt,
-    closed_at: pull.state === 'closed' ? pull.updatedAt : null,
-    merged_at: pull.mergedAt,
-    merge_commit_sha: pull.mergeCommitSha,
+    id: repo.id * 1000000 + pr.number,
+    node_id: store.pullGlobalId(repo, pr.number),
+    number: pr.number,
+    title: pr.title,
+    body: pr.body,
+    state: pr.state,
+    head: { ref: pr.headRef, sha: pr.headSha, label: `${VIEWER_LOGIN}:${pr.headRef}` },
+    base: { ref: pr.baseRef, sha: pr.baseSha, label: `${VIEWER_LOGIN}:${pr.baseRef}` },
+    merged: pr.merged,
+    merged_at: pr.mergedAt,
+    merge_commit_sha: pr.mergeCommitSha,
+    mergeable,
+    mergeable_state: mergeable === null ? 'unknown' : mergeable ? 'clean' : 'dirty',
+    user: userJson(VIEWER_LOGIN, VIEWER_ID),
     assignee: null,
-    assignees: [],
-    requested_reviewers: [],
-    requested_teams: [],
-    labels: [],
-    milestone: null,
     draft: false,
-    commits_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull.number}/commits`),
-    review_comments_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pull.number}/comments`),
-    review_comment_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/pulls/comments{/number}`),
-    comments_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/${pull.number}/comments`),
-    statuses_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/commits/${pull.headSha}/statuses`),
-    head: {
-      label: `${repo.owner}:${pull.head}`,
-      ref: pull.head,
-      sha: pull.headSha,
-      user: headUser,
-      repo: repoJson(ctx, repo),
-    },
-    base: {
-      label: `${repo.owner}:${pull.base}`,
-      ref: pull.base,
-      sha: pull.baseSha,
-      user: headUser,
-      repo: repoJson(ctx, repo),
-    },
-    author_association: 'OWNER',
-    auto_merge: null,
-    active_lock_reason: null,
-    merged: pull.merged,
-    mergeable: pull.state === 'open',
-    mergeable_state: pull.state === 'open' ? 'clean' : 'unknown',
-    merged_by: pull.merged ? { login: pull.user, id: 1000, node_id: 'U_1000', type: 'User' } : null,
+    created_at: ISO_TIME,
+    updated_at: ISO_TIME,
+    closed_at: pr.state === 'closed' ? ISO_TIME : null,
+    html_url: `${BASE}/${repo.owner}/${repo.name}/pull/${pr.number}`,
+    url: `/api/v3/repos/${repo.owner}/${repo.name}/pulls/${pr.number}`,
   };
 }
 
-function commentJson(ctx: Ctx, repo: Repo, issue: Issue, comment: { id: number; body: string; user: string; createdAt: string; updatedAt: string }): Record<string, unknown> {
-  return {
-    id: comment.id,
-    node_id: globalId('IssueComment', `${repo.owner}/${repo.name}#${issue.number}#${comment.id}`),
-    url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/comments/${comment.id}`),
-    html_url: `https://github.com/${repo.owner}/${repo.name}/issues/${issue.number}#issuecomment-${comment.id}`,
-    issue_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`),
-    user: { login: comment.user, id: 1000, node_id: 'U_1000', type: 'User' },
-    created_at: comment.createdAt,
-    updated_at: comment.updatedAt,
-    author_association: 'OWNER',
-    body: comment.body,
-    reactions: { url: '', total_count: 0, '+1': 0, '-1': 0, laugh: 0, hooray: 0, confused: 0, heart: 0, rocket: 0, eyes: 0 },
-    performed_via_github_app: null,
-  };
+interface RestCtx {
+  store: Store;
+  req: IncomingMessage;
+  res: ServerResponse;
+  parts: string[]; // decoded path segments after /api/v3
+  query: URLSearchParams;
+  body: Buffer;
+  baseUrl: string; // same-origin base for Link headers
 }
 
-function branchJson(ctx: Ctx, repo: Repo, name: string, sha: string): Record<string, unknown> {
-  return {
-    name,
-    commit: { sha, url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/commits/${sha}`) },
-    protected: false,
-  };
+/** Paginate a list; returns the page slice and a Link header value (or ''). */
+function paginate<T>(items: T[], query: URLSearchParams, baseUrl: string, path: string): { page: T[]; link: string } {
+  const perPage = Math.max(1, Math.min(100, num(query.get('per_page'), 30)));
+  const pageNum = Math.max(1, num(query.get('page'), 1));
+  const start = (pageNum - 1) * perPage;
+  const page = items.slice(start, start + perPage);
+  let link = '';
+  if (start + page.length < items.length) {
+    const q = new URLSearchParams(query);
+    q.set('page', String(pageNum + 1));
+    q.set('per_page', String(perPage));
+    link = `<${baseUrl}${path}?${q.toString()}>; rel="next"`;
+  }
+  return { page, link };
 }
 
-function commitJson(ctx: Ctx, repo: Repo, sha: string): Record<string, unknown> | null {
-  const object = repo.objects.get(sha);
-  if (!object || object.type !== 'commit') return null;
-  const view = parseCommit(object.data);
-  const authorLine = view.author || 'ada iversen <adaiversen@example.invalid>';
-  const authorName = authorLine.replace(/ <.*$/, '');
-  const authorEmail = (authorLine.match(/<([^>]*)>/) ?? [])[1] ?? '';
-  const authorDate = new Date().toISOString();
-  return {
-    sha,
-    node_id: `C_${sha.slice(0, 12)}`,
-    commit: {
-      author: { name: authorName, email: authorEmail, date: authorDate },
-      committer: { name: authorName, email: authorEmail, date: authorDate },
-      message: view.message,
-      tree: { sha: view.tree, url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/trees/${view.tree}`) },
-      url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/commits/${sha}`),
-      comment_count: 0,
-      verification: { verified: false, reason: 'unsigned', signature: null, payload: null },
-    },
-    url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/commits/${sha}`),
-    html_url: `https://github.com/${repo.owner}/${repo.name}/commit/${sha}`,
-    comments_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/commits/${sha}/comments`),
-    author: { login: 'adaiversen', id: 1000, node_id: 'U_1000', type: 'User' },
-    committer: { login: 'adaiversen', id: 1000, node_id: 'U_1000', type: 'User' },
-    parents: view.parents.map((parent) => ({ sha: parent, url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/commits/${parent}`), html_url: `https://github.com/${repo.owner}/${repo.name}/commit/${parent}` })),
-  };
+function commitListJson(repo: Repo, tip: string, perPage: number): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  const stack = [tip];
+  while (stack.length > 0 && out.length < perPage) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const c = repo.parseCommitCached(oid);
+    if (!c) continue;
+    out.push({
+      sha: oid,
+      commit: {
+        message: c.message,
+        author: { name: VIEWER_LOGIN, email: 'adaiversen@example.invalid', date: ISO_TIME },
+        committer: { name: VIEWER_LOGIN, email: 'adaiversen@example.invalid', date: ISO_TIME },
+      },
+      parents: c.parents.map((p) => ({ sha: p })),
+    });
+    for (let i = c.parents.length - 1; i >= 0; i -= 1) stack.push(c.parents[i]);
+  }
+  return out;
 }
 
-function contentsFileJson(ctx: Ctx, repo: Repo, path: string, oid: string, data: Buffer): Record<string, unknown> {
-  const name = path.split('/').pop() ?? path;
-  return {
-    type: 'file',
-    encoding: 'base64',
-    size: data.length,
-    name,
-    path,
-    content: data.toString('base64'),
-    sha: oid,
-    url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/contents/${path}`),
-    git_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/blobs/${oid}`),
-    html_url: `https://github.com/${repo.owner}/${repo.name}/blob/HEAD/${path}`,
-    download_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/contents/${path}?raw=1`),
-    _links: {
-      git: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/blobs/${oid}`),
-      self: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/contents/${path}`),
-      html: `https://github.com/${repo.owner}/${repo.name}/blob/HEAD/${path}`,
-    },
-  };
-}
+export function handleRest(ctx: RestCtx): boolean {
+  const { store, req, res, parts, query, body } = ctx;
+  const method = req.method ?? 'GET';
 
-// ---------------------------------------------------------------------------
-// Router
-// ---------------------------------------------------------------------------
+  const notFound = (): void => sendJson(res, 404, { message: 'Not Found' });
+  const badRequest = (message: string): void => sendJson(res, 400, { message });
+  const unprocessable = (message: string): void => sendJson(res, 422, { message });
 
-export function isRestPath(pathParts: string[]): boolean {
-  return pathParts.length >= 2 && pathParts[0] === 'api' && pathParts[1] === 'v3';
-}
+  let jsonBody: Record<string, unknown> | undefined;
+  if (method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE') {
+    if (body.length > 0) {
+      try {
+        jsonBody = parseJsonBody(body);
+      } catch {
+        badRequest('Problems parsing JSON');
+        return true;
+      }
+    }
+  }
 
-export function handleRest(forge: Forge, ctx: Ctx, res: ServerResponse): boolean {
-  if (!isRestPath(ctx.pathParts)) return false;
-  const extra: Record<string, string> = { 'X-OAuth-Scopes': OAUTH_SCOPES };
-  try {
-    if (!ctx.token) {
-      sendJson(res, 401, ctx, { message: 'Requires authentication' }, extra);
+  // -- root / meta / user ----------------------------------------------------
+  if (parts.length === 0) {
+    if (method === 'GET') {
+      sendJson(res, 200, { current_user_url: '/api/v3/user', repository_url: '/api/v3/repos/{owner}/{repo}' }, { 'x-oauth-scopes': 'repo' });
       return true;
     }
-    handleRestInner(forge, ctx, res, extra);
-  } catch (err) {
-    if (!res.headersSent) sendJson(res, 500, ctx, { message: (err as Error).message || 'Internal error' }, extra);
-    else res.end();
+    return false;
   }
-  return true;
-}
-
-function handleRestInner(forge: Forge, ctx: Ctx, res: ServerResponse, extra: Record<string, string>): void {
-  const parts = ctx.pathParts;
-
-  // GET /api/v3/ — the root.
-  if (parts.length === 2) {
-    if (ctx.method !== 'GET') return sendNotFound(res, ctx);
-    return sendJson(res, 200, ctx, {
-      current_user_url: absoluteUrl(ctx, '/api/v3/user'),
-      current_user_authorizations_html_url: 'https://github.com/settings/applications/authorizations',
-      authorizations_url: absoluteUrl(ctx, '/api/v3/authorizations'),
-      code_search_url: absoluteUrl(ctx, '/api/v3/search/code{?q}'),
-      commit_search_url: absoluteUrl(ctx, '/api/v3/search/commits{?q}'),
-      emails_url: absoluteUrl(ctx, '/api/v3/user/emails'),
-      emojis_url: absoluteUrl(ctx, '/api/v3/emojis'),
-      events_url: absoluteUrl(ctx, '/api/v3/events'),
-      feeds_url: absoluteUrl(ctx, '/api/v3/feeds'),
-      followers_url: absoluteUrl(ctx, '/api/v3/user/followers'),
-      following_url: absoluteUrl(ctx, '/api/v3/user/following{/other_user}'),
-      gists_url: absoluteUrl(ctx, '/api/v3/gists{/gist_id}'),
-      hub_url: absoluteUrl(ctx, '/api/v3/hub'),
-      issue_search_url: absoluteUrl(ctx, '/api/v3/search/issues{?q}'),
-      issues_url: absoluteUrl(ctx, '/api/v3/issues'),
-      keys_url: absoluteUrl(ctx, '/api/v3/user/keys'),
-      label_search_url: absoluteUrl(ctx, '/api/v3/search/labels{?q}'),
-      notifications_url: absoluteUrl(ctx, '/api/v3/notifications'),
-      organization_url: absoluteUrl(ctx, '/api/v3/orgs/{org}'),
-      organization_repositories_url: absoluteUrl(ctx, '/api/v3/orgs/{org}/repos{?type,page,per_page,sort}'),
-      organization_teams_url: absoluteUrl(ctx, '/api/v3/orgs/{org}/teams'),
-      public_gists_url: absoluteUrl(ctx, '/api/v3/gists/public'),
-      rate_limit_url: absoluteUrl(ctx, '/api/v3/rate_limit'),
-      repository_url: absoluteUrl(ctx, '/api/v3/repos/{owner}/{repo}'),
-      repository_search_url: absoluteUrl(ctx, '/api/v3/search/repositories{?q}'),
-      current_user_repositories_url: absoluteUrl(ctx, '/api/v3/user/repos{?type,page,per_page,sort}'),
-      starred_url: absoluteUrl(ctx, '/api/v3/user/starred{/owner}{/repo}'),
-      starred_gists_url: absoluteUrl(ctx, '/api/v3/gists/starred'),
-      topic_search_url: absoluteUrl(ctx, '/api/v3/search/topics{?q}'),
-      user_url: absoluteUrl(ctx, '/api/v3/users/{user}'),
-      user_organizations_url: absoluteUrl(ctx, '/api/v3/user/orgs'),
-      user_repositories_url: absoluteUrl(ctx, '/api/v3/users/{user}/repos{?type,page,per_page,sort}'),
-      user_search_url: absoluteUrl(ctx, '/api/v3/search/users{?q}'),
-    }, extra);
-  }
-
-  // GET /api/v3/meta
-  if (parts.length === 3 && parts[2] === 'meta') {
-    if (ctx.method !== 'GET') return sendNotFound(res, ctx);
-    return sendJson(res, 200, ctx, { verifiable_password_authentication: true, installed_version: '1.0.0', github_enterprise_version: '1.0.0' }, extra);
-  }
-
-  // GET /api/v3/user
-  if (parts.length === 3 && parts[2] === 'user') {
-    if (ctx.method !== 'GET') return sendNotFound(res, ctx);
-    return sendJson(res, 200, ctx, userJson(), extra);
-  }
-
-  // /api/v3/user/repos
-  if (parts.length === 4 && parts[2] === 'user' && parts[3] === 'repos') {
-    if (ctx.method === 'GET') {
-      const repos = forge.reposOf('adaiversen').map((repo) => repoJson(ctx, repo));
-      const { page, links } = paginate(ctx, repos);
-      const headers: Record<string, string> = { ...extra };
-      if (links) headers.Link = links;
-      return sendJson(res, 200, ctx, page, headers);
+  if (parts[0] === 'meta' && parts.length === 1) {
+    if (method === 'GET') {
+      sendJson(res, 200, { installed_version: '1.0.0' });
+      return true;
     }
-    if (ctx.method === 'POST') {
-      const body = parseJsonBody(ctx);
-      if (rejectBadJson(res, ctx, body)) return;
-      const input = (body ?? {}) as Record<string, unknown>;
-      const name = typeof input.name === 'string' ? input.name : '';
-      if (!name) return sendError(res, 422, ctx, 'name is required');
-      const created = forge.createRepo('adaiversen', name, {
-        description: typeof input.description === 'string' ? input.description : '',
-        private: input.private === true,
+    return false;
+  }
+  if (parts[0] === 'user' && parts.length === 1) {
+    if (method === 'GET') {
+      sendJson(res, 200, { ...userJson(VIEWER_LOGIN, VIEWER_ID), name: 'ada iversen', email: 'adaiversen@example.invalid' });
+      return true;
+    }
+    return false;
+  }
+  if (parts[0] === 'user' && parts[1] === 'repos') {
+    if (method === 'POST') {
+      const name = str(jsonBody?.name);
+      if (name === '') {
+        unprocessable('name is required');
+        return true;
+      }
+      if (store.getRepo(VIEWER_LOGIN, name) !== undefined) {
+        unprocessable('name already exists on this account');
+        return true;
+      }
+      const repo = store.createRepo(VIEWER_LOGIN, name, bool(jsonBody?.private, false), str(jsonBody?.description, ''));
+      sendJson(res, 201, repoJson(store, repo));
+      return true;
+    }
+    if (method === 'GET') {
+      const repos = store.listReposByOwner(VIEWER_LOGIN);
+      const { page, link } = paginate(repos, query, ctx.baseUrl, '/api/v3/user/repos');
+      sendJson(res, 200, page.map((r) => repoJson(store, r)), link === '' ? {} : { link });
+      return true;
+    }
+    return false;
+  }
+
+  // -- /repos/{owner}/{repo}/... ---------------------------------------------
+  if (parts[0] !== 'repos' || parts.length < 3) return false;
+  const owner = parts[1];
+  const repoName = parts[2];
+  const repo = store.getRepo(owner, repoName);
+  if (repo === undefined) {
+    notFound();
+    return true;
+  }
+  const rest = parts.slice(3);
+
+  // /repos/{o}/{r} itself
+  if (rest.length === 0) {
+    if (method === 'GET') {
+      sendJson(res, 200, repoJson(store, repo));
+      return true;
+    }
+    if (method === 'PATCH') {
+      if (jsonBody?.description !== undefined) repo.description = str(jsonBody.description);
+      sendJson(res, 200, repoJson(store, repo));
+      return true;
+    }
+    if (method === 'DELETE') {
+      store.deleteRepo(owner, repoName);
+      sendEmpty(res, 204);
+      return true;
+    }
+    return false;
+  }
+
+  // branches
+  if (rest[0] === 'branches') {
+    if (rest.length === 1 && method === 'GET') {
+      const list = repo.sortedRefs().filter((r) => r.name.startsWith('refs/heads/')).map((r) => ({
+        name: r.name.slice('refs/heads/'.length),
+        commit: { sha: r.oid },
+        protected: false,
+      }));
+      sendJson(res, 200, list);
+      return true;
+    }
+    if (rest.length === 2 && method === 'GET') {
+      const oid = repo.getRef(`refs/heads/${rest[1]}`);
+      if (oid === undefined) {
+        notFound();
+        return true;
+      }
+      sendJson(res, 200, { name: rest[1], commit: { sha: oid }, protected: false });
+      return true;
+    }
+    return false;
+  }
+
+  // git/refs
+  if (rest[0] === 'git' && rest[1] === 'refs') {
+    if (method === 'POST' && rest.length === 2) {
+      const ref = str(jsonBody?.ref);
+      const sha = str(jsonBody?.sha);
+      if (!ref.startsWith('refs/')) {
+        unprocessable('ref must start with refs/');
+        return true;
+      }
+      if (repo.getRef(ref) !== undefined) {
+        unprocessable('reference already exists');
+        return true;
+      }
+      if (repo.getObject(sha) === undefined) {
+        unprocessable('invalid sha');
+        return true;
+      }
+      repo.setRef(ref, sha);
+      sendJson(res, 201, { ref, object: { sha, type: 'commit' }, url: `/api/v3/repos/${owner}/${repoName}/git/refs/${ref}` });
+      return true;
+    }
+    if (method === 'GET' && rest.length === 4 && rest[2] === 'heads') {
+      const oid = repo.getRef(`refs/heads/${rest[3]}`);
+      if (oid === undefined) {
+        notFound();
+        return true;
+      }
+      sendJson(res, 200, { ref: `refs/heads/${rest[3]}`, object: { sha: oid, type: 'commit' } });
+      return true;
+    }
+    return false;
+  }
+
+  // commits
+  if (rest[0] === 'commits' && rest.length === 1 && method === 'GET') {
+    const refName = query.get('sha');
+    let tip: string | undefined;
+    if (refName !== null) tip = repo.resolveRef(refName) ?? repo.getRef(`refs/heads/${refName}`);
+    else tip = repo.headOid();
+    if (tip === undefined) {
+      sendJson(res, 200, []);
+      return true;
+    }
+    const perPage = Math.max(1, Math.min(100, num(query.get('per_page'), 30)));
+    sendJson(res, 200, commitListJson(repo, tip, perPage));
+    return true;
+  }
+
+  // contents (path may contain slashes; take the remainder of the URL path)
+  if (rest[0] === 'contents') {
+    const contentPath = rest.slice(1).join('/');
+    if (method === 'PUT') {
+      const message = str(jsonBody?.message);
+      const contentB64 = str(jsonBody?.content);
+      const branch = str(jsonBody?.branch, repo.defaultBranch);
+      const sha = jsonBody?.sha !== undefined ? str(jsonBody.sha) : undefined;
+      let content: Buffer;
+      try {
+        content = Buffer.from(contentB64, 'base64');
+      } catch {
+        badRequest('content is not valid base64');
+        return true;
+      }
+      const branchTip = repo.getRef(`refs/heads/${branch}`);
+      const existing = branchTip !== undefined ? repo.readFileAt(branchTip, contentPath) : undefined;
+      if (sha !== undefined) {
+        if (existing === undefined) {
+          notFound();
+          return true;
+        }
+        if (existing.oid !== sha) {
+          sendJson(res, 409, { message: 'sha does not match' });
+          return true;
+        }
+      } else if (existing !== undefined) {
+        unprocessable('file already exists');
+        return true;
+      }
+      const result = repo.putFile(branch, contentPath, content, message);
+      sendJson(res, result.created ? 201 : 200, {
+        content: {
+          name: contentPath.split('/').pop(),
+          path: contentPath,
+          sha: result.blobSha,
+          size: content.length,
+          type: 'file',
+          encoding: 'base64',
+          url: `/api/v3/repos/${owner}/${repoName}/contents/${contentPath}`,
+        },
+        commit: { sha: result.commitSha, message },
       });
-      if ('error' in created) return sendError(res, 422, ctx, created.error);
-      return sendJson(res, 201, ctx, repoJson(ctx, created), extra);
+      return true;
     }
-    return sendNotFound(res, ctx);
-  }
-
-  // /api/v3/repos/{owner}/{name}/...
-  if (parts.length >= 5 && parts[2] === 'repos') {
-    const owner = parts[3]!;
-    const name = parts[4]!;
-    const repo = forge.getRepo(owner, name);
-    const tail = parts.slice(5);
-
-    // The repository itself.
-    if (tail.length === 0) {
-      if (ctx.method === 'GET') {
-        if (!repo) return sendNotFound(res, ctx);
-        return sendJson(res, 200, ctx, repoJson(ctx, repo), extra);
-      }
-      if (ctx.method === 'PATCH') {
-        if (!repo) return sendNotFound(res, ctx);
-        const body = parseJsonBody(ctx);
-        if (rejectBadJson(res, ctx, body)) return;
-        const input = (body ?? {}) as Record<string, unknown>;
-        if (typeof input.description === 'string') repo.description = input.description;
-        if (typeof input.private === 'boolean') repo.private = input.private;
-        repo.updatedAt = nowIso();
-        repo.restJson = null;
-        return sendJson(res, 200, ctx, repoJson(ctx, repo), extra);
-      }
-      if (ctx.method === 'DELETE') {
-        if (!repo) return sendNotFound(res, ctx);
-        forge.deleteRepo(owner, name);
-        res.writeHead(204, { 'X-GitHub-Request-Id': ctx.requestId, ...extra });
-        res.end();
-        return;
-      }
-      return sendNotFound(res, ctx);
-    }
-
-    if (!repo) return sendNotFound(res, ctx);
-
-    // POST /git/refs
-    if (tail.length === 2 && tail[0] === 'git' && tail[1] === 'refs' && ctx.method === 'POST') {
-      const body = parseJsonBody(ctx);
-      if (rejectBadJson(res, ctx, body)) return;
-      const input = (body ?? {}) as Record<string, unknown>;
-      const ref = typeof input.ref === 'string' ? input.ref : '';
-      const sha = typeof input.sha === 'string' ? input.sha : '';
-      if (!ref.startsWith('refs/') || !isObjectId(sha) || !repo.objects.has(sha)) {
-        return sendError(res, 422, ctx, 'Invalid ref or sha');
-      }
-      if (repo.refs.has(ref)) return sendError(res, 422, ctx, 'Reference already exists');
-      repo.refs.set(ref, sha);
-      repo.restJson = null;
-      return sendJson(res, 201, ctx, {
-        ref,
-        node_id: `R_${sha.slice(0, 12)}`,
-        url: absoluteUrl(ctx, `/api/v3/repos/${owner}/${name}/git/refs/${ref.replace(/^refs\//, '')}`),
-        object: { sha, type: repo.objects.get(sha)!.type, url: absoluteUrl(ctx, `/api/v3/repos/${owner}/${name}/git/commits/${sha}`) },
-      }, extra);
-    }
-
-    // GET /git/refs/heads/{branch}
-    if (tail.length >= 4 && tail[0] === 'git' && tail[1] === 'refs' && tail[2] === 'heads' && ctx.method === 'GET') {
-      const branch = tail.slice(3).join('/');
-      const sha = repo.refs.get(`refs/heads/${branch}`);
-      if (!sha) return sendNotFound(res, ctx);
-      return sendJson(res, 200, ctx, {
-        ref: `refs/heads/${branch}`,
-        node_id: `R_${sha.slice(0, 12)}`,
-        url: absoluteUrl(ctx, `/api/v3/repos/${owner}/${name}/git/refs/heads/${branch}`),
-        object: { sha, type: repo.objects.get(sha)?.type ?? 'commit', url: absoluteUrl(ctx, `/api/v3/repos/${owner}/${name}/git/commits/${sha}`) },
-      }, extra);
-    }
-
-    // GET /branches
-    if (tail.length === 1 && tail[0] === 'branches' && ctx.method === 'GET') {
-      const branches: Record<string, unknown>[] = [];
-      for (const refName of [...repo.refs.keys()].sort()) {
-        if (!refName.startsWith('refs/heads/')) continue;
-        branches.push(branchJson(ctx, repo, refName.slice('refs/heads/'.length), repo.refs.get(refName)!));
-      }
-      return sendJson(res, 200, ctx, branches, extra);
-    }
-
-    // GET /branches/{branch}
-    if (tail.length >= 2 && tail[0] === 'branches' && ctx.method === 'GET') {
-      const branch = tail.slice(1).join('/');
-      const sha = repo.refs.get(`refs/heads/${branch}`);
-      if (!sha) return sendNotFound(res, ctx);
-      return sendJson(res, 200, ctx, branchJson(ctx, repo, branch, sha), extra);
-    }
-
-    // GET /commits
-    if (tail.length === 1 && tail[0] === 'commits' && ctx.method === 'GET') {
-      const ref = ctx.query.get('sha') ?? undefined;
+    if (method === 'GET') {
+      const refName = query.get('ref');
       let tip: string | undefined;
-      if (ref === undefined || ref === '') tip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-      else if (repo.refs.has(`refs/heads/${ref}`)) tip = repo.refs.get(`refs/heads/${ref}`);
-      else if (repo.refs.has(`refs/tags/${ref}`)) tip = repo.refs.get(`refs/tags/${ref}`);
-      else if (repo.objects.has(ref)) tip = ref;
-      if (!tip) return sendJson(res, 200, ctx, [], extra);
-      const history = commitHistory(repo, tip);
-      const commits: Record<string, unknown>[] = [];
-      for (const sha of history) {
-        const entry = commitJson(ctx, repo, sha);
-        if (entry) commits.push(entry);
+      if (refName !== null) tip = repo.resolveRef(refName) ?? repo.getRef(`refs/heads/${refName}`);
+      else tip = repo.headOid();
+      if (tip === undefined) {
+        notFound();
+        return true;
       }
-      const { page, links } = paginate(ctx, commits);
-      const headers: Record<string, string> = { ...extra };
-      if (links) headers.Link = links;
-      return sendJson(res, 200, ctx, page, headers);
-    }
-
-    // /contents/{path...}
-    if (tail[0] === 'contents') {
-      const path = tail.slice(1).join('/');
-      return handleContents(forge, repo, ctx, res, extra, path);
-    }
-
-    // POST /labels
-    if (tail.length === 1 && tail[0] === 'labels' && ctx.method === 'POST') {
-      const body = parseJsonBody(ctx);
-      if (rejectBadJson(res, ctx, body)) return;
-      const input = (body ?? {}) as Record<string, unknown>;
-      const labelName = typeof input.name === 'string' ? input.name : '';
-      const color = typeof input.color === 'string' ? input.color : 'ededed';
-      if (!labelName) return sendError(res, 422, ctx, 'name is required');
-      const existing = repo.labels.get(labelName);
-      if (existing) {
-        return sendJson(res, 201, ctx, { id: 0, node_id: '', name: existing.name, color: existing.color, default: false, description: '' }, extra);
+      if (contentPath === '') {
+        const entries = repo.listDirAt(tip, '');
+        sendJson(res, 200, (entries ?? []).map((e) => ({
+          name: e.name,
+          path: e.path,
+          sha: e.oid,
+          size: 0,
+          type: e.type,
+          url: `/api/v3/repos/${owner}/${repoName}/contents/${e.path}`,
+        })));
+        return true;
       }
-      const label = { name: labelName, color };
-      repo.labels.set(labelName, label);
-      return sendJson(res, 201, ctx, { id: 0, node_id: '', name: label.name, color: label.color, default: false, description: '' }, extra);
-    }
-
-    // /issues
-    if (tail[0] === 'issues') {
-      return handleIssues(forge, repo, ctx, res, extra, tail.slice(1));
-    }
-
-    // /pulls
-    if (tail[0] === 'pulls') {
-      return handlePulls(forge, repo, ctx, res, extra, tail.slice(1));
-    }
-  }
-
-  return sendNotFound(res, ctx);
-}
-
-// ---------------------------------------------------------------------------
-// Contents
-// ---------------------------------------------------------------------------
-
-function handleContents(forge: Forge, repo: Repo, ctx: Ctx, res: ServerResponse, extra: Record<string, string>, path: string): void {
-  if (ctx.method === 'GET') {
-    const ref = ctx.query.get('ref') ?? undefined;
-    const found = forge.readPath(repo, ref, path);
-    if (!found) return sendNotFound(res, ctx);
-    if (found.kind === 'file') {
-      return sendJson(res, 200, ctx, contentsFileJson(ctx, repo, path, found.oid, found.data), extra);
-    }
-    const entries = found.entries.map((entry) => ({
-      type: entry.type,
-      size: entry.type === 'file' ? (repo.objects.get(entry.oid)?.data.length ?? 0) : 0,
-      name: entry.name,
-      path: entry.path,
-      sha: entry.oid,
-      url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/contents/${entry.path}`),
-      git_url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/${entry.type === 'dir' ? 'trees' : 'blobs'}/${entry.oid}`),
-      html_url: `https://github.com/${repo.owner}/${repo.name}/${entry.type === 'dir' ? 'tree' : 'blob'}/HEAD/${entry.path}`,
-      download_url: entry.type === 'file' ? absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/contents/${entry.path}?raw=1`) : null,
-      _links: {
-        git: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/${entry.type === 'dir' ? 'trees' : 'blobs'}/${entry.oid}`),
-        self: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/contents/${entry.path}`),
-        html: `https://github.com/${repo.owner}/${repo.name}/${entry.type === 'dir' ? 'tree' : 'blob'}/HEAD/${entry.path}`,
-      },
-    }));
-    return sendJson(res, 200, ctx, entries, extra);
-  }
-
-  if (ctx.method === 'PUT') {
-    const body = parseJsonBody(ctx);
-    if (rejectBadJson(res, ctx, body)) return;
-    const input = (body ?? {}) as Record<string, unknown>;
-    const message = typeof input.message === 'string' ? input.message : 'Update file';
-    const contentB64 = typeof input.content === 'string' ? input.content : '';
-    const branch = typeof input.branch === 'string' && input.branch !== '' ? input.branch : repo.defaultBranch;
-    const givenSha = typeof input.sha === 'string' ? input.sha : undefined;
-    let content: Buffer;
-    try {
-      content = Buffer.from(contentB64, 'base64');
-      if (contentB64 !== '' && content.toString('base64').replace(/=+$/, '') !== contentB64.replace(/=+$/, '')) {
-        return sendError(res, 422, ctx, 'content is not valid base64');
+      const file = repo.readFileAt(tip, contentPath);
+      if (file !== undefined) {
+        sendJson(res, 200, {
+          name: contentPath.split('/').pop(),
+          path: contentPath,
+          sha: file.oid,
+          size: file.data.length,
+          type: 'file',
+          encoding: 'base64',
+          content: file.data.toString('base64'),
+          url: `/api/v3/repos/${owner}/${repoName}/contents/${contentPath}`,
+        });
+        return true;
       }
-    } catch {
-      return sendError(res, 422, ctx, 'content is not valid base64');
+      const dir = repo.listDirAt(tip, contentPath);
+      if (dir !== undefined) {
+        sendJson(res, 200, dir.map((e) => ({
+          name: e.name,
+          path: e.path,
+          sha: e.oid,
+          size: 0,
+          type: e.type,
+          url: `/api/v3/repos/${owner}/${repoName}/contents/${e.path}`,
+        })));
+        return true;
+      }
+      notFound();
+      return true;
     }
-    const existing = forge.readPath(repo, branch, path);
-    if (givenSha !== undefined && existing && existing.kind === 'file' && existing.oid !== givenSha) {
-      return sendError(res, 409, ctx, 'sha does not match the current file');
+    if (method === 'DELETE') {
+      const message = str(jsonBody?.message);
+      const branch = str(jsonBody?.branch, repo.defaultBranch);
+      const result = repo.deleteFile(branch, contentPath, message);
+      if (result === undefined) {
+        notFound();
+        return true;
+      }
+      sendJson(res, 200, { commit: { sha: result.commitSha, message } });
+      return true;
     }
-    const isCreate = !existing || existing.kind !== 'file';
-    const { commitSha, contentSha } = forge.commitFile(repo, branch, path, content, message);
-    return sendJson(res, isCreate ? 201 : 200, ctx, {
-      content: contentsFileJson(ctx, repo, path, contentSha, content),
-      commit: { sha: commitSha, message, url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/commits/${commitSha}`) },
-    }, extra);
+    return false;
   }
 
-  if (ctx.method === 'DELETE') {
-    const body = parseJsonBody(ctx);
-    if (rejectBadJson(res, ctx, body)) return;
-    const input = (body ?? {}) as Record<string, unknown>;
-    const message = typeof input.message === 'string' ? input.message : 'Delete file';
-    const givenSha = typeof input.sha === 'string' ? input.sha : undefined;
-    const branch = typeof input.branch === 'string' && input.branch !== '' ? input.branch : repo.defaultBranch;
-    const existing = forge.readPath(repo, branch, path);
-    if (!existing || existing.kind !== 'file') return sendNotFound(res, ctx);
-    if (givenSha !== undefined && existing.oid !== givenSha) {
-      return sendError(res, 409, ctx, 'sha does not match the current file');
+  // labels
+  if (rest[0] === 'labels' && rest.length === 1 && method === 'POST') {
+    const name = str(jsonBody?.name);
+    const color = str(jsonBody?.color, '000000');
+    if (name === '') {
+      unprocessable('name is required');
+      return true;
     }
-    const deleted = forge.deleteFile(repo, branch, path, message);
-    if (!deleted) return sendNotFound(res, ctx);
-    return sendJson(res, 200, ctx, {
-      commit: { sha: deleted.commitSha, message, url: absoluteUrl(ctx, `/api/v3/repos/${repo.owner}/${repo.name}/git/commits/${deleted.commitSha}`) },
-    }, extra);
+    repo.labels.set(name, { name, color });
+    sendJson(res, 201, { name, color, description: '', default: false, url: `/api/v3/repos/${owner}/${repoName}/labels/${encodeURIComponent(name)}` });
+    return true;
   }
 
-  return sendNotFound(res, ctx);
-}
-
-// ---------------------------------------------------------------------------
-// Issues
-// ---------------------------------------------------------------------------
-
-function handleIssues(forge: Forge, repo: Repo, ctx: Ctx, res: ServerResponse, extra: Record<string, string>, tail: string[]): void {
-  if (tail.length === 0) {
-    if (ctx.method === 'GET') {
-      const state = ctx.query.get('state') ?? 'open';
-      const direction = ctx.query.get('direction') ?? 'desc';
-      let issues = [...repo.issues];
-      if (state === 'open') issues = issues.filter((issue) => issue.state === 'open');
-      else if (state === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
-      issues.sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
-      const rendered = issues.map((issue) => JSON.parse(issueJson(ctx, repo, issue)) as Record<string, unknown>);
-      const { page, links } = paginate(ctx, rendered);
-      const headers: Record<string, string> = { ...extra };
-      if (links) headers.Link = links;
-      return sendJson(res, 200, ctx, page, headers);
+  // issues
+  if (rest[0] === 'issues') {
+    if (rest.length === 1) {
+      if (method === 'POST') {
+        const title = str(jsonBody?.title);
+        const bodyText = str(jsonBody?.body, '');
+        const labelNames: string[] = Array.isArray(jsonBody?.labels) ? (jsonBody.labels as unknown[]).map((l) => str(l)) : [];
+        for (const l of labelNames) {
+          if (!repo.labels.has(l)) {
+            unprocessable(`label "${l}" does not exist`);
+            return true;
+          }
+        }
+        if (title === '') {
+          unprocessable('title is required');
+          return true;
+        }
+        const issue = repo.createIssue(title, bodyText, labelNames);
+        sendJson(res, 201, issueJson(store, repo, issue));
+        return true;
+      }
+      if (method === 'GET') {
+        const state = query.get('state') ?? 'open';
+        const direction = query.get('direction') ?? 'desc';
+        let list = repo.issues.filter((i) => state === 'all' || i.state === state);
+        list = [...list].sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
+        const { page, link } = paginate(list, query, ctx.baseUrl, `/api/v3/repos/${owner}/${repoName}/issues`);
+        sendJson(res, 200, page.map((i) => issueJson(store, repo, i)), link === '' ? {} : { link });
+        return true;
+      }
+      return false;
     }
-    if (ctx.method === 'POST') {
-      const body = parseJsonBody(ctx);
-      if (rejectBadJson(res, ctx, body)) return;
-      const input = (body ?? {}) as Record<string, unknown>;
-      const created = forge.createIssue(repo, {
-        title: typeof input.title === 'string' ? input.title : '',
-        body: typeof input.body === 'string' ? input.body : '',
-        labels: Array.isArray(input.labels) ? input.labels.filter((label): label is string => typeof label === 'string') : [],
-      });
-      if ('error' in created) return sendError(res, 422, ctx, created.error);
-      return sendJson(res, 201, ctx, issueJson(ctx, repo, created), extra);
+    const issueNum = parseInt(rest[1], 10);
+    if (Number.isNaN(issueNum)) return false;
+    const issue = repo.findIssue(issueNum);
+    if (rest.length === 2) {
+      if (issue === undefined) {
+        notFound();
+        return true;
+      }
+      if (method === 'GET') {
+        sendJsonString(res, 200, issueJsonString(store, repo, issue));
+        return true;
+      }
+      if (method === 'PATCH') {
+        if (jsonBody?.state === 'open' || jsonBody?.state === 'closed') issue.state = jsonBody.state as 'open' | 'closed';
+        if (jsonBody?.title !== undefined) issue.title = str(jsonBody.title);
+        if (jsonBody?.body !== undefined) issue.body = str(jsonBody.body);
+        repo.invalidateIssue(issue.number);
+        sendJson(res, 200, issueJson(store, repo, issue));
+        return true;
+      }
+      return false;
     }
-    return sendNotFound(res, ctx);
+    if (rest.length === 3 && rest[2] === 'comments') {
+      if (issue === undefined) {
+        notFound();
+        return true;
+      }
+      if (method === 'POST') {
+        const bodyText = str(jsonBody?.body);
+        const comment = { id: repo.commentCounter, body: bodyText };
+        repo.commentCounter += 1;
+        issue.comments.push(comment);
+        repo.invalidateIssue(issue.number);
+        sendJson(res, 201, {
+          id: comment.id,
+          node_id: store.commentGlobalId(repo, comment.id),
+          body: comment.body,
+          user: userJson(VIEWER_LOGIN, VIEWER_ID),
+          created_at: ISO_TIME,
+          updated_at: ISO_TIME,
+          html_url: `${BASE}/${owner}/${repoName}/issues/${issue.number}#issuecomment-${comment.id}`,
+        });
+        return true;
+      }
+      if (method === 'GET') {
+        sendJson(res, 200, issue.comments.map((c) => ({
+          id: c.id,
+          node_id: store.commentGlobalId(repo, c.id),
+          body: c.body,
+          user: userJson(VIEWER_LOGIN, VIEWER_ID),
+          created_at: ISO_TIME,
+          updated_at: ISO_TIME,
+        })));
+        return true;
+      }
+      return false;
+    }
+    return false;
   }
 
-  const number = Number.parseInt(tail[0]!, 10);
-  if (!Number.isInteger(number)) return sendNotFound(res, ctx);
-  const issue = forge.getIssue(repo, number);
-  if (!issue) return sendNotFound(res, ctx);
-
-  if (tail.length === 1) {
-    if (ctx.method === 'GET') return sendJson(res, 200, ctx, issueJson(ctx, repo, issue), extra);
-    if (ctx.method === 'PATCH') {
-      const body = parseJsonBody(ctx);
-      if (rejectBadJson(res, ctx, body)) return;
-      const input = (body ?? {}) as Record<string, unknown>;
-      if (typeof input.title === 'string') issue.title = input.title;
-      if (typeof input.body === 'string') issue.body = input.body;
-      if (input.state === 'open' || input.state === 'closed') forge.setIssueState(repo, issue, input.state);
-      else issue.restJson = null;
-      issue.updatedAt = nowIso();
-      issue.restJson = null;
-      return sendJson(res, 200, ctx, issueJson(ctx, repo, issue), extra);
+  // pulls
+  if (rest[0] === 'pulls') {
+    if (rest.length === 1) {
+      if (method === 'POST') {
+        const head = str(jsonBody?.head);
+        const base = str(jsonBody?.base);
+        const title = str(jsonBody?.title);
+        const bodyText = str(jsonBody?.body, '');
+        if (repo.getRef(`refs/heads/${head}`) === undefined) {
+          unprocessable('head branch does not exist');
+          return true;
+        }
+        if (repo.getRef(`refs/heads/${base}`) === undefined) {
+          unprocessable('base branch does not exist');
+          return true;
+        }
+        const dup = repo.pulls.find((p) => p.state === 'open' && p.headRef === head && p.baseRef === base);
+        if (dup !== undefined) {
+          unprocessable('a pull request already exists');
+          return true;
+        }
+        const pr = repo.createPull(title, bodyText, head, base);
+        sendJson(res, 201, pullJson(store, repo, pr));
+        return true;
+      }
+      if (method === 'GET') {
+        const state = query.get('state') ?? 'open';
+        const list = repo.pulls.filter((p) => state === 'all' || p.state === state);
+        const { page, link } = paginate(list, query, ctx.baseUrl, `/api/v3/repos/${owner}/${repoName}/pulls`);
+        sendJson(res, 200, page.map((p) => pullJson(store, repo, p)), link === '' ? {} : { link });
+        return true;
+      }
+      return false;
     }
-    return sendNotFound(res, ctx);
+    const prNum = parseInt(rest[1], 10);
+    if (Number.isNaN(prNum)) return false;
+    const pr = repo.findPull(prNum);
+    if (rest.length === 2) {
+      if (pr === undefined) {
+        notFound();
+        return true;
+      }
+      if (method === 'GET') {
+        sendJson(res, 200, pullJson(store, repo, pr));
+        return true;
+      }
+      return false;
+    }
+    if (rest.length === 3 && rest[2] === 'files' && method === 'GET') {
+      if (pr === undefined) {
+        notFound();
+        return true;
+      }
+      const baseTip = repo.getRef(`refs/heads/${pr.baseRef}`);
+      const headTip = repo.getRef(`refs/heads/${pr.headRef}`);
+      if (baseTip === undefined || headTip === undefined) {
+        sendJson(res, 200, []);
+        return true;
+      }
+      const baseTree = repo.treeOf(baseTip);
+      const headTree = repo.treeOf(headTip);
+      if (baseTree === undefined || headTree === undefined) {
+        sendJson(res, 200, []);
+        return true;
+      }
+      const diff = repo.diffTrees(baseTree, headTree);
+      sendJson(res, 200, diff.map((d) => ({
+        filename: d.path,
+        status: d.status,
+        additions: d.additions,
+        deletions: d.deletions,
+        changes: d.changes,
+      })));
+      return true;
+    }
+    if (rest.length === 3 && rest[2] === 'merge' && method === 'PUT') {
+      if (pr === undefined) {
+        notFound();
+        return true;
+      }
+      if (pr.state === 'closed') {
+        sendJson(res, 405, { message: 'pull request is already closed' });
+        return true;
+      }
+      const result = repo.mergePullRequest(pr);
+      if ('conflict' in result) {
+        sendJson(res, 405, { message: 'merge conflict' });
+        return true;
+      }
+      sendJson(res, 200, { sha: result.commitSha, merged: true, message: `${pr.title} (#${pr.number})` });
+      return true;
+    }
+    return false;
   }
 
-  if (tail.length === 2 && tail[1] === 'comments') {
-    if (ctx.method === 'GET') {
-      const comments = (repo.comments.get(issue.number) ?? []).map((comment) => commentJson(ctx, repo, issue, comment));
-      return sendJson(res, 200, ctx, comments, extra);
-    }
-    if (ctx.method === 'POST') {
-      const body = parseJsonBody(ctx);
-      if (rejectBadJson(res, ctx, body)) return;
-      const input = (body ?? {}) as Record<string, unknown>;
-      const commentBody = typeof input.body === 'string' ? input.body : '';
-      if (!commentBody) return sendError(res, 422, ctx, 'body is required');
-      const comment = forge.createComment(repo, issue, commentBody);
-      return sendJson(res, 201, ctx, commentJson(ctx, repo, issue, comment), extra);
-    }
-    return sendNotFound(res, ctx);
-  }
-
-  return sendNotFound(res, ctx);
-}
-
-// ---------------------------------------------------------------------------
-// Pull requests
-// ---------------------------------------------------------------------------
-
-function handlePulls(forge: Forge, repo: Repo, ctx: Ctx, res: ServerResponse, extra: Record<string, string>, tail: string[]): void {
-  if (tail.length === 0) {
-    if (ctx.method === 'GET') {
-      const state = ctx.query.get('state') ?? 'open';
-      let pulls = [...repo.pulls];
-      if (state === 'open') pulls = pulls.filter((pull) => pull.state === 'open');
-      else if (state === 'closed') pulls = pulls.filter((pull) => pull.state === 'closed');
-      pulls.sort((a, b) => b.number - a.number);
-      const rendered = pulls.map((pull) => pullJson(ctx, repo, pull));
-      const { page, links } = paginate(ctx, rendered);
-      const headers: Record<string, string> = { ...extra };
-      if (links) headers.Link = links;
-      return sendJson(res, 200, ctx, page, headers);
-    }
-    if (ctx.method === 'POST') {
-      const body = parseJsonBody(ctx);
-      if (rejectBadJson(res, ctx, body)) return;
-      const input = (body ?? {}) as Record<string, unknown>;
-      const created = forge.createPull(repo, {
-        head: typeof input.head === 'string' ? input.head : '',
-        base: typeof input.base === 'string' ? input.base : '',
-        title: typeof input.title === 'string' ? input.title : '',
-        body: typeof input.body === 'string' ? input.body : '',
-      });
-      if ('error' in created) return sendError(res, 422, ctx, created.error);
-      return sendJson(res, 201, ctx, pullJson(ctx, repo, created), extra);
-    }
-    return sendNotFound(res, ctx);
-  }
-
-  const number = Number.parseInt(tail[0]!, 10);
-  if (!Number.isInteger(number)) return sendNotFound(res, ctx);
-  const pull = forge.getPull(repo, number);
-  if (!pull) return sendNotFound(res, ctx);
-
-  if (tail.length === 1) {
-    if (ctx.method === 'GET') return sendJson(res, 200, ctx, pullJson(ctx, repo, pull), extra);
-    return sendNotFound(res, ctx);
-  }
-
-  if (tail.length === 2 && tail[1] === 'files' && ctx.method === 'GET') {
-    const files = forge.pullFiles(repo, pull);
-    return sendJson(res, 200, ctx, files, extra);
-  }
-
-  if (tail.length === 2 && tail[1] === 'merge' && ctx.method === 'PUT') {
-    const merged = forge.mergePull(repo, pull);
-    if (!merged) {
-      return sendError(res, 405, ctx, pull.state === 'closed' ? 'Pull request is already merged or closed' : 'Merge conflict');
-    }
-    return sendJson(res, 200, ctx, { merged: true, sha: merged.sha, message: 'Pull Request successfully merged' }, extra);
-  }
-
-  return sendNotFound(res, ctx);
+  return false;
 }

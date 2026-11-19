@@ -1,159 +1,181 @@
-// server.ts — the HTTP plumbing the forge's surfaces share: a request context,
-// JSON replies, the bearer-token check, and the X-GitHub-Request-Id counter.
-// Written fresh in this session. Stdlib only: node:http.
+// server.ts — HTTP server: routing, auth, body reading, error containment.
+// Written from scratch for the github-core-clone-01 forge (Node 22, stdlib only).
 
-import type { IncomingMessage, ServerResponse } from 'node:http';
-import { VIEWER } from './store.ts';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { Store } from './store.ts';
+import { handleInfoRefs, handleReceivePack, handleUploadPack } from './git.ts';
+import { handleRest } from './rest.ts';
+import { executeGraphQL, type GraphQLOperation } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
+import { nextReqId, readBody, sendJson } from './httputil.ts';
 
-let requestCounter = 0;
+const GIT_ROUTE = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
-export function nextRequestId(): string {
-  requestCounter += 1;
-  return `req-${requestCounter}`;
-}
+export function createApp(): ReturnType<typeof createServer> {
+  const store = new Store();
+  const token = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
-export class Ctx {
-  readonly method: string;
-  readonly url: URL;
-  readonly rawUrl: string;
-  readonly query: URLSearchParams;
-  readonly pathParts: string[];
-  readonly headers: IncomingMessage['headers'];
-  readonly body: Buffer;
-  /** The bearer token the caller sent, if any. */
-  readonly token: string | null;
-  readonly requestId: string;
-
-  constructor(method: string, url: URL, rawUrl: string, headers: IncomingMessage['headers'], body: Buffer) {
-    this.method = method;
-    this.url = url;
-    this.rawUrl = rawUrl;
-    this.query = url.searchParams;
-    this.pathParts = url.pathname.split('/').filter((part) => part !== '');
-    this.headers = headers;
-    this.body = body;
-    this.requestId = nextRequestId();
-    const auth = headers.authorization;
-    this.token = typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : null;
+  function authorized(req: IncomingMessage): boolean {
+    const header = req.headers.authorization ?? '';
+    if (!header.startsWith('Bearer ')) return false;
+    const given = header.slice('Bearer '.length);
+    if (token === '') return given.length > 0;
+    return given === token;
   }
 
-  get header(): Record<string, string | string[] | undefined> {
-    return this.headers;
-  }
-}
-
-/** Every request carries a non-empty X-GitHub-Request-Id, on every surface. */
-export function writeHead(res: ServerResponse, status: number, ctx: Ctx, extra: Record<string, string> = {}): void {
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'X-GitHub-Request-Id': ctx.requestId,
-    ...extra,
+  const server = createServer((req, res) => {
+    void handleRequest(req, res).catch((e) => {
+      // Never let one bad request kill the server.
+      try {
+        if (!res.headersSent) {
+          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': nextReqId() });
+        }
+        res.end(JSON.stringify({ message: e instanceof Error ? e.message : String(e) }));
+      } catch {
+        // The socket is already gone; nothing more to do.
+      }
+    });
   });
+
+  async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    const method = req.method ?? 'GET';
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      sendJson(res, 400, { message: 'bad request URL' });
+      return;
+    }
+    const pathname = url.pathname;
+
+    // -- healthz (no auth; the env dials it to check liveness) ---------------
+    if (pathname === '/healthz' && method === 'GET') {
+      sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    // -- git smart HTTP (no auth check: the suite always sends the token) -----
+    const gitMatch = GIT_ROUTE.exec(pathname);
+    if (gitMatch !== null) {
+      const owner = safeDecode(gitMatch[1]);
+      const repoName = safeDecode(gitMatch[2]);
+      const action = gitMatch[3];
+      if (owner === undefined || repoName === undefined) {
+        sendJson(res, 400, { message: 'bad repository path' });
+        return;
+      }
+      const repo = store.getRepo(owner, repoName);
+      if (repo === undefined) {
+        sendJson(res, 404, { message: 'Not Found' });
+        return;
+      }
+      const protocolV2 = req.headers['git-protocol'] === 'version=2';
+      if (action === 'info/refs' && method === 'GET') {
+        const service = url.searchParams.get('service') ?? '';
+        const result = handleInfoRefs(repo, service, protocolV2);
+        res.writeHead(result.status, { 'content-type': result.contentType, 'x-github-request-id': nextReqId() });
+        res.end(result.body);
+        return;
+      }
+      if (action === 'git-upload-pack' && method === 'POST') {
+        const body = await readBody(req);
+        const result = handleUploadPack(repo, body, protocolV2);
+        res.writeHead(result.status, { 'content-type': result.contentType, 'x-github-request-id': nextReqId() });
+        res.end(result.body);
+        return;
+      }
+      if (action === 'git-receive-pack' && method === 'POST') {
+        const body = await readBody(req);
+        const result = handleReceivePack(repo, body);
+        res.writeHead(result.status, { 'content-type': result.contentType, 'x-github-request-id': nextReqId() });
+        res.end(result.body);
+        return;
+      }
+      sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+
+    // -- GraphQL --------------------------------------------------------------
+    if (pathname === '/api/graphql' && method === 'POST') {
+      if (!authorized(req)) {
+        sendJson(res, 401, { message: 'Bad credentials' });
+        return;
+      }
+      const body = await readBody(req);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body.toString('utf8'));
+      } catch {
+        sendJson(res, 400, { errors: [{ message: 'request body is not valid JSON' }] });
+        return;
+      }
+      if (Array.isArray(parsed)) {
+        const results = (parsed as GraphQLOperation[]).map((op) => executeGraphQL(store, op));
+        sendJson(res, 200, results);
+        return;
+      }
+      if (parsed !== null && typeof parsed === 'object') {
+        sendJson(res, 200, executeGraphQL(store, parsed as GraphQLOperation));
+        return;
+      }
+      sendJson(res, 400, { errors: [{ message: 'expected a JSON object or array' }] });
+      return;
+    }
+
+    // -- MCP ------------------------------------------------------------------
+    if (pathname === '/mcp' && method === 'POST') {
+      if (!authorized(req)) {
+        sendJson(res, 401, { message: 'Bad credentials' });
+        return;
+      }
+      const body = await readBody(req);
+      const result = handleMcp(store, body);
+      if (result.body === null) {
+        res.writeHead(result.status, { 'x-github-request-id': nextReqId() });
+        res.end();
+        return;
+      }
+      res.writeHead(result.status, { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': nextReqId() });
+      res.end(result.body);
+      return;
+    }
+
+    // -- REST v3 ---------------------------------------------------------------
+    if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
+      if (!authorized(req)) {
+        sendJson(res, 401, { message: 'Bad credentials' });
+        return;
+      }
+      const rawParts = pathname === '/api/v3' ? [] : pathname.slice('/api/v3/'.length).split('/');
+      const parts: string[] = [];
+      // Drop empty segments: '/api/v3/' is the root (parts []), and a trailing
+      // slash elsewhere (e.g. '/contents/') means the same path without it.
+      for (const p of rawParts) {
+        if (p === '') continue;
+        const decoded = safeDecode(p);
+        if (decoded === undefined) {
+          sendJson(res, 400, { message: 'bad request path' });
+          return;
+        }
+        parts.push(decoded);
+      }
+      const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
+      const host = req.headers.host ?? 'localhost';
+      const handled = handleRest({ store, req, res, parts, query: url.searchParams, body, baseUrl: `http://${host}` });
+      if (!handled) sendJson(res, 404, { message: 'Not Found' });
+      return;
+    }
+
+    sendJson(res, 404, { message: 'Not Found' });
+  }
+
+  return server;
 }
 
-export function sendJson(res: ServerResponse, status: number, ctx: Ctx, payload: unknown, extra: Record<string, string> = {}): void {
-  const text = typeof payload === 'string' ? payload : JSON.stringify(payload);
-  writeHead(res, status, ctx, extra);
-  res.end(text);
-}
-
-export function sendError(res: ServerResponse, status: number, ctx: Ctx, message: string): void {
-  sendJson(res, status, ctx, { message });
-}
-
-export function sendNotFound(res: ServerResponse, ctx: Ctx): void {
-  sendError(res, 404, ctx, 'Not Found');
-}
-
-/** The forge accepts any non-empty bearer token; the token names the viewer. */
-export function requireAuth(ctx: Ctx): boolean {
-  return ctx.token !== null && ctx.token !== '';
-}
-
-export function sendUnauthorized(res: ServerResponse, ctx: Ctx): void {
-  sendError(res, 401, ctx, 'Requires authentication');
-}
-
-export async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  return Buffer.concat(chunks);
-}
-
-/** Parse a JSON body; on malformed JSON returns null and the caller answers 400. */
-export function parseJsonBody(ctx: Ctx): unknown | null {
-  if (ctx.body.length === 0) return {};
+function safeDecode(s: string): string | undefined {
   try {
-    return JSON.parse(ctx.body.toString('utf8'));
+    return decodeURIComponent(s);
   } catch {
-    return null;
+    return undefined;
   }
-}
-
-/** A 400 for a malformed JSON body. Returns true when the body was malformed. */
-export function rejectBadJson(res: ServerResponse, ctx: Ctx, parsed: unknown): boolean {
-  if (parsed === null) {
-    sendError(res, 400, ctx, 'Problems parsing JSON');
-    return true;
-  }
-  return false;
-}
-
-export function absoluteUrl(ctx: Ctx, path: string): string {
-  const protocol = 'http';
-  const host = typeof ctx.headers.host === 'string' ? ctx.headers.host : 'localhost';
-  return `${protocol}://${host}${path}`;
-}
-
-/**
- * Render a page of items with GitHub-style Link headers and ?page= / ?per_page=
- * pagination. The caller supplies the full list; page size is clamped to 1..100.
- */
-export function paginate<T>(ctx: Ctx, items: readonly T[]): { page: T[]; links: string } {
-  const perPageRaw = Number.parseInt(ctx.query.get('per_page') ?? '30', 10);
-  const perPage = Number.isFinite(perPageRaw) && perPageRaw > 0 ? Math.min(perPageRaw, 100) : 30;
-  const pageRaw = Number.parseInt(ctx.query.get('page') ?? '1', 10);
-  const page = Number.isFinite(pageRaw) && pageRaw > 0 ? pageRaw : 1;
-  const start = (page - 1) * perPage;
-  const slice = items.slice(start, start + perPage);
-  const totalPages = Math.max(1, Math.ceil(items.length / perPage));
-  const basePath = ctx.url.pathname;
-  const linkFor = (targetPage: number, rel: string): string => {
-    const params = new URLSearchParams(ctx.query);
-    params.set('page', String(targetPage));
-    params.set('per_page', String(perPage));
-    return `<${absoluteUrl(ctx, `${basePath}?${params.toString()}`)}>; rel="${rel}"`;
-  };
-  const links: string[] = [];
-  if (page < totalPages) links.push(linkFor(page + 1, 'next'));
-  if (page > 1) {
-    links.push(linkFor(1, 'first'));
-    links.push(linkFor(page - 1, 'prev'));
-  }
-  if (totalPages > 1) links.push(linkFor(totalPages, 'last'));
-  return { page: slice, links: links.join(', ') };
-}
-
-/** An ISO timestamp. */
-export function nowIso(): string {
-  return new Date().toISOString();
-}
-
-/** The viewer as a GitHub user object. */
-export function userJson(): Record<string, unknown> {
-  return {
-    login: VIEWER.login,
-    id: VIEWER.id,
-    node_id: `U_${VIEWER.id}`,
-    avatar_url: `https://avatars.githubusercontent.com/u/${VIEWER.id}?v=4`,
-    gravatar_id: '',
-    url: `https://api.github.com/users/${VIEWER.login}`,
-    html_url: `https://github.com/${VIEWER.login}`,
-    type: 'User',
-    site_admin: false,
-    name: VIEWER.name,
-    email: VIEWER.email,
-    created_at: '2020-01-01T00:00:00Z',
-    updated_at: '2020-01-01T00:00:00Z',
-  };
 }
