@@ -196,6 +196,11 @@ export function computeSendSet(
       const object = repo.objects.get(oid);
       if (!object) continue;
       if (object.type === 'tag') {
+        // A wanted tag is itself part of the send set (its object must
+        // round-trip, e.g. clone-annotated-tag); its target is traversed at
+        // the same distance (a tag adds no depth).
+        included.add(oid);
+        if (!held.has(oid)) sendCommits.add(oid);
         const target = parseTag(object.data).object;
         if (target && !seen.has(target)) queue.push({ oid: target, distance });
         continue;
@@ -234,16 +239,58 @@ export function computeSendSet(
   }
   unshallow.sort();
 
-  // The objects to send: the closure of the send-set commits, minus what the
-  // client already holds.
+  // The objects to send: the tree/blob closure of the send-set commits,
+  // minus what the client already holds. This must NOT follow parent links
+  // (collectReachable does) — the depth limit already decided the commit
+  // set, and following parents would send the full history for a shallow
+  // fetch and tank clone perf.
   const objects = new Map<string, GitObject>();
-  const reachable = collectReachable(repo, [...sendCommits]);
+  const reachable = collectSendObjects(repo, [...sendCommits]);
   for (const oid of reachable) {
     if (held.has(oid)) continue;
     const object = repo.objects.get(oid);
     if (object) objects.set(oid, object);
   }
   return { objects, shallow, unshallow };
+}
+
+/** The tree/blob closure of a set of commits/tags, without following parent links. */
+function collectSendObjects(repo: Repo, roots: Iterable<string>): Set<string> {
+  const seen = new Set<string>();
+  const queue: string[] = [];
+  for (const root of roots) {
+    if (root && root !== ZERO_OID && !seen.has(root)) {
+      seen.add(root);
+      queue.push(root);
+    }
+  }
+  while (queue.length > 0) {
+    const oid = queue.pop()!;
+    const object = repo.objects.get(oid);
+    if (!object) continue;
+    if (object.type === 'commit') {
+      const view = parseCommit(object.data);
+      if (view.tree && !seen.has(view.tree)) {
+        seen.add(view.tree);
+        queue.push(view.tree);
+      }
+      // Do NOT follow parents — the depth limit already decided the set.
+    } else if (object.type === 'tag') {
+      const target = parseTag(object.data).object;
+      if (target && !seen.has(target)) {
+        seen.add(target);
+        queue.push(target);
+      }
+    } else if (object.type === 'tree') {
+      for (const entry of parseTree(object.data)) {
+        if (!seen.has(entry.oid)) {
+          seen.add(entry.oid);
+          queue.push(entry.oid);
+        }
+      }
+    }
+  }
+  return seen;
 }
 
 /** Whether any have is an ancestor of (or equal to) any want — the ACK target. */
@@ -387,13 +434,15 @@ function lsRefsLines(repo: Repo, options: { peel: boolean; symrefs: boolean; pre
   for (const refName of sortedRefNames(repo)) {
     if (!include(refName)) continue;
     const oid = repo.refs.get(refName)!;
-    lines.push(`${oid} ${refName}\n`);
+    // v2 ls-refs carries the peel as an attribute on the SAME line
+    // ("<oid> <ref> peeled:<commit>"), not as a separate "^{}" line
+    // (that form is only for the v0 advertisement).
+    let line = `${oid} ${refName}`;
     if (options.peel) {
       const object = repo.objects.get(oid);
-      if (object && object.type === 'tag') {
-        lines.push(`${parseTag(object.data).object} ${refName}^{}\n`);
-      }
+      if (object && object.type === 'tag') line += ` peeled:${parseTag(object.data).object}`;
     }
+    lines.push(`${line}\n`);
   }
   return lines;
 }

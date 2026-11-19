@@ -656,17 +656,28 @@ export class Forge {
   /** Whether a pull request can merge cleanly (no file changed differently on both sides). */
   pullMergeable(repo: Repo, pull: PullRequest): 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' {
     if (pull.state !== 'open') return 'UNKNOWN';
-    const base = mergeBase(repo, pull.baseSha, pull.headSha);
+    // Mergeability is evaluated against the CURRENT branch tips, not the
+    // creation-time snapshots: after another PR merges and the base branch
+    // moves, a PR that was mergeable can become conflicting.
+    const baseTip = repo.refs.get(`refs/heads/${pull.base}`);
+    const headTip = repo.refs.get(`refs/heads/${pull.head}`);
+    if (!baseTip || !headTip) return 'UNKNOWN';
+    const base = mergeBase(repo, baseTip, headTip);
     if (!base) return 'UNKNOWN';
     const baseTree = commitTree(repo, base);
-    const baseTipTree = commitTree(repo, pull.baseSha);
-    const headTree = commitTree(repo, pull.headSha);
+    const baseTipTree = commitTree(repo, baseTip);
+    const headTree = commitTree(repo, headTip);
     const baseChanges = diffTrees(repo, baseTree, baseTipTree);
     const headChanges = diffTrees(repo, baseTree, headTree);
     const baseByPath = new Map(baseChanges.map((change) => [change.path, change]));
     for (const change of headChanges) {
       const other = baseByPath.get(change.path);
-      if (other && other.newOid !== change.newOid) return 'CONFLICTING';
+      if (!other) continue;
+      // Both sides changed this path: conflict unless the results agree
+      // (a removal counts as a null result).
+      const headResult = change.status === 'removed' ? null : change.newOid;
+      const baseResult = other.status === 'removed' ? null : other.newOid;
+      if (headResult !== baseResult) return 'CONFLICTING';
     }
     return 'MERGEABLE';
   }
@@ -685,6 +696,18 @@ export class Forge {
     const baseTree = base ? commitTree(repo, base) : '';
     const headTree = commitTree(repo, headTip);
     const headChanges = diffTrees(repo, baseTree, headTree);
+    // Three-way conflict check: a file changed on BOTH sides of the
+    // merge-base with different results cannot merge cleanly.
+    const baseTipTree = commitTree(repo, baseTip);
+    const baseChanges = diffTrees(repo, baseTree, baseTipTree);
+    const baseByPath = new Map(baseChanges.map((change) => [change.path, change]));
+    for (const change of headChanges) {
+      const other = baseByPath.get(change.path);
+      if (!other) continue;
+      const headResult = change.status === 'removed' ? null : change.newOid;
+      const baseResult = other.status === 'removed' ? null : other.newOid;
+      if (headResult !== baseResult) return null;
+    }
     const files = flattenTree(repo, commitTree(repo, baseTip));
     for (const change of headChanges) {
       if (change.status === 'removed') files.delete(change.path);
